@@ -119,10 +119,10 @@ exports.googleLogin = async (idToken) => {
 
   let user = await User.findOne({ email });
   if (!user) {
-    const role = await Role.findOne({ name: "customer" }); // ✅ lookup role thật
+    const role = await Role.findOne({ name: "customer" }); 
     if (!role) throw new Error("Role 'customer' chưa được seed");
 
-    // tránh trùng username
+
     const base = email.split("@")[0];
     let username = base, i = 1;
     while (await User.findOne({ username })) username = `${base}${i++}`;
@@ -132,7 +132,7 @@ exports.googleLogin = async (idToken) => {
       email,
       username,
       avatar_url: payload.picture,
-      role_id: role._id,           // ✅
+      role_id: role._id, 
       status: "active",
     });
   }
@@ -143,7 +143,7 @@ exports.googleLogin = async (idToken) => {
   user.last_login = new Date();
   await user.save();
 
-  // (khuyến nghị) trả kèm role info
+
   const role = await Role.findById(user.role_id).lean();
   const safe = user.toObject(); delete safe.password_hash; delete safe.refresh_token;
   safe.role_name = role?.name || null;
