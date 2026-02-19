@@ -26,10 +26,10 @@ import ManageProducts from "../pages/shop/ManageProducts";  // ĐỔI tên file 
 import AddProduct from "../pages/shop/AddProduct";          // tạo/sửa sản phẩm
 // Các trang mới khuyến nghị có sẵn (placeholder nếu chưa tạo)
 import LowStockPage from "../pages/shop/LowStockPage";     // hàng sắp hết
-// import CategoriesPage from "../pages/shop/catalog/CategoriesPage";   // CRUD danh mục
-// import AttributesPage from "../pages/shop/catalog/AttributesPage";   // CRUD thuộc tính
-// import BrandsPage from "../pages/shop/catalog/BrandsPage";           // CRUD brand
-// import VariantsPage from "../pages/shop/VariantsPage";               // quản lý biến thể theo sản phẩm
+import CategoriesPage from "../pages/shop/CategoriesPage";   // CRUD danh mục
+import AttributesPage from "../pages/shop/AttributesPage";   // CRUD thuộc tính
+import BrandsPage from "../pages/shop/BrandsPage";           // CRUD brand
+import VariantsPage from "../pages/shop/VariantsPage";               // quản lý biến thể theo sản phẩm
 
 /* ===== Other Roles ===== */
 import SystemConfig from "../pages/admin/SystemConfig";

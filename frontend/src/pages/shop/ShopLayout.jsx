@@ -1,6 +1,5 @@
 import React from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import "./shop.css";
 
 export default function ShopLayout() {
   const items = [

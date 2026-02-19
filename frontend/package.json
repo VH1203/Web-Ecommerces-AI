@@ -18,6 +18,8 @@
     "axios": "^1.12.2",
     "bootstrap": "^5.3.8",
     "chart.js": "^4.5.1",
+    "dayjs": "^1.11.19",
+    "file-saver": "^2.0.5",
     "lucide-react": "^0.545.0",
     "mdb-react-ui-kit": "^9.0.0",
     "primeicons": "^7.0.0",

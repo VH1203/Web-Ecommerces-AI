@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { sellerCatalogService } from "../../../services/sellerCatalogService";
+import { sellerCatalogService } from "../../services/sellerCatalogService";
 export default function CategoriesPage(){
   const [rows, setRows] = useState([]);
   useEffect(()=>{ (async()=>setRows(await sellerCatalogService.listCategories()))(); },[]);

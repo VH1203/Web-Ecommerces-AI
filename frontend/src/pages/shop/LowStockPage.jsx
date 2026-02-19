@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { productService } from "../../../services/productService";
+import  { useEffect, useState } from "react";
+import { productService } from "../../services/productService";
 
 export default function LowStockPage(){
   const [rows, setRows] = useState([]);
