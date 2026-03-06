@@ -31,6 +31,8 @@ const UserSchema = new mongoose.Schema(
       size_top: String,
       size_bottom: String,
     },
+    wishlist: [{ type: String, ref: "Product" }],
+    recently_viewed: [{ type: String, ref: "Product" }],
     last_login: Date,
   },
   { timestamps: true, versionKey: false, collection: "users" }

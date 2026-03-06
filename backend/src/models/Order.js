@@ -22,7 +22,7 @@ const OrderSchema = new mongoose.Schema(
 
     payment_method: {
       type: String,
-      enum: ["COD", "VNPAY", "MOMO", "WALLET"],
+      enum: ["COD", "PAYPAL", "VNPAY", "WALLET"],
       default: "COD",
     },
     payment_status: {
@@ -44,6 +44,10 @@ const OrderSchema = new mongoose.Schema(
       enum: ["processing","pending", "confirmed", "shipping", "delivered", "canceled_by_customer", "canceled_by_shop", "refund_pending", "refund_completed"],
       default: "pending",
     },
+
+    // Snapshot of the delivery address at order time.
+    // Stored so order history remains correct even if the address is later edited or deleted.
+    shipping_address: { type: Object, default: null },
 
     inventory_adjusted: { type: Boolean, default: false },
     created_by: { type: String, ref: "User" },

@@ -43,7 +43,7 @@ const ProductSchema = new mongoose.Schema(
     base_price: { type: Number, required: true },
     currency: { type: String, default: "VND" },
 
-    shop_id: { type: String, ref: "User" },
+    shop_id: { type: String, ref: "Shop", index: true },
 
     variant_dimensions: [{ type: String, enum: ["color", "size", "material_variant", "pattern", "fit"] }],
 

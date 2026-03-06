@@ -11,6 +11,7 @@ const ProductVariantSchema = new mongoose.Schema(
   {
     _id: { type: String, default: () => `var-${uuidv4()}` },
     product_id: { type: String, ref: "Product", required: true },
+    shop_id: { type: String, ref: "Shop", index: true },
 
     sku: { type: String, unique: true, sparse: true, trim: true },
     barcode: { type: String, unique: true, sparse: true, trim: true },

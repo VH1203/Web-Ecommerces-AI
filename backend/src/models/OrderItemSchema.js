@@ -11,6 +11,7 @@ const OrderItemSchema = new mongoose.Schema(
   {
     product_id: { type: String, ref: "Product", required: true },
     variant_id: { type: String, ref: "ProductVariant" },
+    shop_id: { type: String, ref: "Shop" },
     name: { type: String, required: true },
     image_url: { type: String },
     qty: { type: Number, required: true, min: 1 },
