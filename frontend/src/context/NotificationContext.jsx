@@ -4,10 +4,11 @@ import React, {
 import { io } from "socket.io-client";
 import { useAuth } from "./AuthContext";
 import notificationService from "../services/notificationService";
+import { API_ORIGIN } from "../services/env";
 
 const NotificationContext = createContext(null);
 
-const SOCKET_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const SOCKET_URL = API_ORIGIN;
 
 export function NotificationProvider({ children }) {
   const { user, isAuthenticated } = useAuth();

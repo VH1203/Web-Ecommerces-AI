@@ -9,7 +9,7 @@ const PaymentSchema = new mongoose.Schema(
     },
     order_id: { type: String, ref: "Order", required: true },
     user_id: { type: String, ref: "User", required: true },
-    shop_id: { type: String, ref: "User" },
+    shop_id: { type: String, ref: "Shop" },
     gateway: {
       type: String,
       enum: ["PAYPAL", "VNPAY", "COD"],

@@ -2,6 +2,7 @@
 require("dotenv").config();
 const http = require("http");
 const app = require("./app");
+const { logger } = require("./config/logger");
 
 const FE_ORIGIN = process.env.FE_ORIGIN || "http://localhost:5173";
 const PORT = process.env.PORT || 5000;
@@ -40,13 +41,13 @@ const { connectDB } = require("./config/db");
   try {
     await connectDB();
     server.listen(PORT, () => {
-      console.log(`✅ API + Socket.IO listening on ${PORT}`);
+      logger.info(`API + Socket.IO listening on ${PORT}`);
     });
 
     // Start moderation background jobs after DB is connected
     moderationCron.start();
   } catch (err) {
-    console.error("❌ Failed to start server:", err);
+    logger.error("Failed to start server", { error: err });
     process.exit(1);
   }
 })();

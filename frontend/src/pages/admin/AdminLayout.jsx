@@ -35,7 +35,7 @@ export default function AdminLayout() {
     { to: "/admin/reconciliation",   label: t("finance.title"),            icon: Wallet,         color: "#14b8a6", bg: "rgba(20,184,166,0.1)"  },
     { to: "/admin/api-keys",         label: "Cấu hình & API Keys",         icon: Key,            color: "#f59e0b", bg: "rgba(245,158,11,0.1)"  },
     { divider: true },
-    { to: "/admin/system-config",    label: t("admin.system_config"),      icon: Settings,       color: "#64748b", bg: "rgba(100,116,139,0.1)" },
+    // { to: "/admin/system-config",    label: t("admin.system_config"),      icon: Settings,       color: "#64748b", bg: "rgba(100,116,139,0.1)" },
   ];
 
   const S = {

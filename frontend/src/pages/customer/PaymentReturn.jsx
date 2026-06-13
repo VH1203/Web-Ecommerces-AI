@@ -15,6 +15,7 @@ import {
   AlertCircle,
   Wallet,
 } from "lucide-react";
+import { API_URL } from "../../services/apiClient";
 
 function parseVNDate(s) {
   if (!s || s.length < 14) return "";
@@ -105,8 +106,7 @@ export default function PaymentReturn() {
     pollRef.current = setInterval(async () => {
       attempts++;
       try {
-        const API = (import.meta.env.VITE_API_URL || "http://localhost:5000/api").replace(/\/+$/, "");
-        const res  = await fetch(`${API}/payment/vnpay/check?order_code=${encodeURIComponent(orderCode)}`);
+        const res  = await fetch(`${API_URL}/payment/vnpay/check?order_code=${encodeURIComponent(orderCode)}`);
         const json = await res.json();
         const ps   = json?.data?.payment_status;
         if (ps === "paid") {

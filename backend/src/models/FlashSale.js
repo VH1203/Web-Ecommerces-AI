@@ -22,7 +22,7 @@ const flashSaleSchema = new mongoose.Schema(
       type: String,
       default: () => `fs-${uuidv4()}`,
     },
-    shop_id: { type: String, ref: "User", required: true },
+    shop_id: { type: String, ref: "Shop", required: true },
     title: { type: String, required: true },
     description: { type: String },
     start_time: { type: Date, required: true },

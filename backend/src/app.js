@@ -2,10 +2,14 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 const compression = require("compression");
 const path = require("path");
+const crypto = require("crypto");
+const { requestLogger } = require("./config/logger");
+const { initSentry } = require("./config/sentry");
+const { metricsMiddleware, metricsHandler } = require("./config/metrics");
+const { mountSwagger } = require("./config/swagger");
 
 /* ==== Route imports ==== */
 const homeRoutes = require("./routes/homeRoutes");
@@ -44,6 +48,13 @@ const errorMiddleware = require("./middlewares/errorMiddleware");
 const FE_ORIGIN = process.env.FE_ORIGIN || "http://localhost:5173";
 
 const app = express();
+initSentry();
+
+app.use((req, res, next) => {
+  req.id = req.get("x-request-id") || crypto.randomUUID();
+  res.setHeader("x-request-id", req.id);
+  next();
+});
 
 
 
@@ -93,7 +104,8 @@ app.use("/api", (req, res, next) => {
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(compression());
-app.use(morgan("dev"));
+app.use(requestLogger);
+app.use(metricsMiddleware);
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -101,6 +113,9 @@ app.use(
     message: "Too many requests, please try again later.",
   })
 );
+
+mountSwagger(app);
+app.get("/metrics", metricsHandler);
 
 /* ==== Webhook routes (no auth — must be before auth middleware) ==== */
 app.post("/api/webhooks/ghn", require("./controllers/shopOrderController").handleGhnWebhook);
@@ -157,6 +172,10 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     time: new Date().toISOString(),
   });
+});
+
+app.get("/healthz", (req, res) => {
+  res.status(200).json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
 });
 
 /* ==== Error ==== */

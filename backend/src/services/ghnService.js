@@ -7,9 +7,16 @@
 
 const axios = require("axios");
 
-const GHN_API_URL  = process.env.GHN_API_URL || "https://dev-online-gateway.ghn.vn/shiip/public-api/v2";
-const GHN_TOKEN    = process.env.GHN_TOKEN   || "fb35fa85-1f15-11f1-a973-aee5264794df";
-const GHN_SHOP_ID  = Number(process.env.GHN_SHOP_ID || "199062");
+const GHN_API_URL = process.env.GHN_API_URL || "https://dev-online-gateway.ghn.vn/shiip/public-api/v2";
+const GHN_TOKEN = process.env.GHN_TOKEN;
+const GHN_SHOP_ID = Number(process.env.GHN_SHOP_ID || 0);
+const GHN_DEV_MODE = process.env.GHN_DEV_MODE === "true";
+
+function ensureGhnConfig() {
+  if ((!GHN_TOKEN || !GHN_SHOP_ID) && !GHN_DEV_MODE) {
+    throw new Error("Missing GHN_TOKEN or GHN_SHOP_ID. Set GHN_DEV_MODE=true for local mock flows.");
+  }
+}
 // Location endpoints live at /shiip/public-api (no /v2)
 const GHN_DATA_URL = GHN_API_URL.replace(/\/v\d+$/, "");
 
@@ -19,8 +26,8 @@ const ghnClient = axios.create({
   timeout: 15000,
   headers: {
     "Content-Type": "application/json",
-    "Token":        GHN_TOKEN,
-    "ShopId":       String(GHN_SHOP_ID),
+    "Token":        GHN_TOKEN || "",
+    "ShopId":       String(GHN_SHOP_ID || ""),
   },
 });
 
@@ -30,7 +37,7 @@ const ghnDataClient = axios.create({
   timeout: 15000,
   headers: {
     "Content-Type": "application/json",
-    "Token":        GHN_TOKEN,
+    "Token":        GHN_TOKEN || "",
   },
 });
 
@@ -75,6 +82,7 @@ function mapGhnStatus(ghnStatus) {
  * Fetch GHN province list (for shop pickup address setup).
  */
 async function getProvinces() {
+  ensureGhnConfig();
   const res = await ghnDataClient.get("/master-data/province");
   if (res.data?.code !== 200) throw new Error(res.data?.message || "GHN province error");
   return res.data.data || [];
@@ -84,6 +92,7 @@ async function getProvinces() {
  * Fetch GHN districts for a province.
  */
 async function getDistricts(provinceId) {
+  ensureGhnConfig();
   const res = await ghnDataClient.post("/master-data/district", { province_id: Number(provinceId) });
   if (res.data?.code !== 200) throw new Error(res.data?.message || "GHN district error");
   return res.data.data || [];
@@ -93,6 +102,7 @@ async function getDistricts(provinceId) {
  * Fetch GHN wards for a district.
  */
 async function getWards(districtId) {
+  ensureGhnConfig();
   const res = await ghnDataClient.get("/master-data/ward", { params: { district_id: Number(districtId) } });
   if (res.data?.code !== 200) throw new Error(res.data?.message || "GHN ward error");
   return res.data.data || [];
@@ -104,6 +114,7 @@ async function getWards(districtId) {
  * @param {Object} fromAddress  — Shop pickup address { name, phone, address, district_id, ward_code }
  */
 async function createShippingOrder(order, fromAddress) {
+  ensureGhnConfig();
   const addr = order.shipping_address || {};
 
   // Validate required GHN address fields before calling API
@@ -183,8 +194,9 @@ async function createShippingOrder(order, fromAddress) {
     items,
   };
 
-  console.log(`[GHN] createShippingOrder | order: ${order.order_code} | COD: ${cod_amount}`);
-  console.log(`[GHN] payload:`, JSON.stringify(payload, null, 2));
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`[GHN] createShippingOrder | order: ${order.order_code} | COD: ${cod_amount}`);
+  }
 
   let response;
   try {
@@ -226,6 +238,7 @@ async function createShippingOrder(order, fromAddress) {
 // @param {string} ghnCode — GHN order_code
 // ─────────────────────────────────────────────────────────────────────────────
 async function cancelShippingOrder(ghnCode) {
+  ensureGhnConfig();
   console.log(`[GHN] cancelShippingOrder | ghn_code: ${ghnCode}`);
   const response = await ghnClient.post("/switch-status/cancel", {
     order_codes: [ghnCode],
@@ -248,6 +261,7 @@ async function cancelShippingOrder(ghnCode) {
 // @param {string} ghnCode — GHN order_code
 // ─────────────────────────────────────────────────────────────────────────────
 async function getOrderDetail(ghnCode) {
+  ensureGhnConfig();
   const response = await ghnClient.post("/shipping-order/detail", {
     order_code: ghnCode,
   });
@@ -266,6 +280,7 @@ async function getOrderDetail(ghnCode) {
 // Used to pick the best service_type_id before creating an order.
 // ─────────────────────────────────────────────────────────────────────────────
 async function getAvailableServices(fromDistrictId, toDistrictId) {
+  ensureGhnConfig();
   const response = await ghnClient.get("/shipping-order/available-services", {
     params: {
       shop_id:          GHN_SHOP_ID,
@@ -284,6 +299,7 @@ async function getAvailableServices(fromDistrictId, toDistrictId) {
 // @param {Object} opts — { toDistrictId, toWardCode, weight }
 // ─────────────────────────────────────────────────────────────────────────────
 async function calculateFee({ toDistrictId, toWardCode, weight = 500 }) {
+  ensureGhnConfig();
   const response = await ghnClient.get("/shipping-order/fee", {
     params: {
       service_type_id: 2,

@@ -20,7 +20,7 @@ const CartItemSchema = new mongoose.Schema(
     total: { type: Number, min: 0 },
 
     currency: { type: String, enum: ["VND", "USD"], default: "VND" },
-    shop_id: { type: String, ref: "User" }, 
+    shop_id: { type: String, ref: "Shop" },
   },
   { versionKey: false }
 );

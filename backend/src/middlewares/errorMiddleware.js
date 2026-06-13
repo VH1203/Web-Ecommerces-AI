@@ -1,4 +1,7 @@
 // src/middlewares/errorMiddleware.js
+const { logger } = require("../config/logger");
+const { Sentry } = require("../config/sentry");
+
 function errorMiddleware(err, req, res, next) {
   // ===== Normalize base info =====
   let status =
@@ -83,14 +86,22 @@ function errorMiddleware(err, req, res, next) {
     payload.stack = err.stack;
   }
 
-  // Log full error on server
-  // (giữ nguyên log chi tiết để debug; có thể thay console.error bằng logger)
-  console.error("🔥 Error Middleware:", {
+  if (isServerError && process.env.SENTRY_DSN) {
+    Sentry.captureException(err, {
+      tags: { requestId: payload.requestId, method: req.method },
+      extra: { path: req.originalUrl },
+    });
+  }
+
+  logger.error("Request failed", {
     status,
     message,
     code,
     name: err.name,
     stack: err.stack,
+    requestId: payload.requestId,
+    path: req.originalUrl,
+    method: req.method,
   });
 
   res.status(status).json(payload);

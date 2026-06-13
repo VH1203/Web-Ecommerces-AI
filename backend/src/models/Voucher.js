@@ -28,7 +28,7 @@ const voucherSchema = new mongoose.Schema(
 
     // Phạm vi áp dụng (shop / toàn hệ thống)
     scope: { type: String, enum: ["global", "shop"], default: "shop" },
-    shop_id: { type: String, ref: "User" }, // null nếu global
+    shop_id: { type: String, ref: "Shop" }, // null nếu global
 
     // Hiệu lực
     valid_from: { type: Date, required: true },

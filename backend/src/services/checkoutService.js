@@ -1,6 +1,7 @@
 // services/checkoutService.js
 const notif = require("./dbNotificationService");
 const audit = require("./auditLogService");
+const mongoose = require("mongoose");
 const Cart = require("../models/Cart");
 const Voucher = require("../models/Voucher");
 const Order = require("../models/Order");
@@ -12,6 +13,57 @@ const Shop = require("../models/Shop");
 const ShopCredit = require("../models/ShopCredit");
 const { v4: uuidv4 } = require("uuid");
 const shippingSvc = require("./shippingService");
+const inventory = require("./inventoryService");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// deductStock — decrease ProductVariant.stock for each item in an order.
+// Idempotent: uses inventory_adjusted flag as guard.
+// ─────────────────────────────────────────────────────────────────────────────
+async function deductStock(order, session = null) {
+  await inventory.deductOrderStock(order, { session });
+  console.log(`[INVENTORY] Deducted stock for order ${order.order_code}`);
+}
+
+async function incrementFlashSaleSold(items, flashMap, session = null) {
+  if (!flashMap || flashMap.size === 0) return;
+
+  const qtyByVariant = new Map();
+  for (const item of items || []) {
+    const fi = flashMap.get(String(item.variant_id));
+    if (!fi) continue;
+    const key = String(item.variant_id);
+    const current = qtyByVariant.get(key) || { qty: 0, flash: fi };
+    current.qty += Number(item.qty || 0);
+    qtyByVariant.set(key, current);
+  }
+
+  for (const [variantId, { qty, flash }] of qtyByVariant) {
+    if (qty <= 0) continue;
+    const maxSoldBeforeUpdate = Number(flash.quantity_total || 0) - qty;
+    const result = await FlashSale.updateOne(
+      {
+        _id: flash.flashsale_id,
+        products: {
+          $elemMatch: {
+            variant_id: variantId,
+            quantity_sold: { $lte: maxSoldBeforeUpdate },
+          },
+        },
+      },
+      { $inc: { "products.$.quantity_sold": qty } },
+      { session }
+    );
+    if (result.modifiedCount !== 1) {
+      throw Object.assign(new Error("Flash Sale vừa hết suất cho một số sản phẩm. Vui lòng thử lại."), { status: 409 });
+    }
+  }
+}
+
+function readVariantAttrs(variant) {
+  return variant?.variant_attributes instanceof Map
+    ? Object.fromEntries(variant.variant_attributes)
+    : (variant?.variant_attributes || {});
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getActiveFlashMap — returns Map<variantId, flashItem> for any active flash sales
@@ -53,15 +105,31 @@ async function resolveItems(userId, { selected_item_ids, buy_now_items }) {
   const isBuyNow = Array.isArray(buy_now_items) && buy_now_items.length > 0;
 
   if (isBuyNow) {
-    const result = [];
-    for (const { productId, variantId, quantity } of buy_now_items) {
-      const qty = Math.max(1, Number(quantity) || 1);
+    const requested = buy_now_items
+      .map(({ productId, variantId, quantity }) => ({
+        productId,
+        variantId,
+        qty: Math.max(1, Number(quantity) || 1),
+      }))
+      .filter((item) => item.variantId);
 
-      const variant = await ProductVariant.findById(variantId).lean();
+    if (!requested.length) {
+      throw Object.assign(new Error("Chưa chọn sản phẩm nào"), { status: 400 });
+    }
+
+    const requestedVariantIds = [...new Set(requested.map((i) => String(i.variantId)))];
+    const variants = await ProductVariant.find({ _id: { $in: requestedVariantIds }, is_active: true }).lean();
+    const variantMap = new Map(variants.map((v) => [String(v._id), v]));
+    const productIds = [...new Set(requested.map((i) => String(i.productId || variantMap.get(String(i.variantId))?.product_id)).filter(Boolean))];
+    const products = await Product.find({ _id: { $in: productIds }, status: { $ne: "deleted" } }).lean();
+    const productMap = new Map(products.map((p) => [String(p._id), p]));
+
+    const result = requested.map(({ productId, variantId, qty }) => {
+      const variant = variantMap.get(String(variantId));
       if (!variant) {
-        throw Object.assign(new Error(`Biến thể không tồn tại (id: ${variantId})`), { status: 400 });
+        throw Object.assign(new Error(`Biến thể không tồn tại hoặc đã ngừng bán (id: ${variantId})`), { status: 400 });
       }
-      const product = await Product.findById(productId || variant.product_id).lean();
+      const product = productMap.get(String(productId || variant.product_id));
       if (!product) {
         throw Object.assign(new Error("Sản phẩm không tồn tại"), { status: 400 });
       }
@@ -75,26 +143,21 @@ async function resolveItems(userId, { selected_item_ids, buy_now_items }) {
         );
       }
 
-      // Build variant label from attributes map
-      const attrs = variant.variant_attributes instanceof Map
-        ? Object.fromEntries(variant.variant_attributes)
-        : (variant.variant_attributes || {});
-
-      result.push({
+      return {
         product_id: product._id,
         variant_id: variant._id,
-        shop_id: product.shop_id || null,
+        shop_id: product.shop_id || variant.shop_id || null,
         name: product.name,
         image_url: variant.images?.[0] || product.images?.[0] || "",
-        variant_attributes: attrs,
+        variant_attributes: readVariantAttrs(variant),
         sku: variant.sku || null,
         compare_at_price: variant.compare_at_price || null,
         qty,
         price: variant.price,
         discount: 0,
         total: variant.price * qty,
-      });
-    }
+      };
+    });
 
     // Apply active flash sale prices (buy-now path)
     const variantIds = result.map((i) => String(i.variant_id));
@@ -133,15 +196,24 @@ async function resolveItems(userId, { selected_item_ids, buy_now_items }) {
   }
 
   const result = [];
+  const cartVariantIds = [...new Set(cartItems.map((i) => String(i.variant_id)).filter(Boolean))];
+  const cartProductIds = [...new Set(cartItems.map((i) => String(i.product_id)).filter(Boolean))];
+  const [variants, products] = await Promise.all([
+    ProductVariant.find({ _id: { $in: cartVariantIds }, is_active: true }).lean(),
+    Product.find({ _id: { $in: cartProductIds }, status: { $ne: "deleted" } }).lean(),
+  ]);
+  const variantMap = new Map(variants.map((v) => [String(v._id), v]));
+  const productMap = new Map(products.map((p) => [String(p._id), p]));
+
   for (const ci of cartItems) {
-    const variant = await ProductVariant.findById(ci.variant_id).lean();
+    const variant = variantMap.get(String(ci.variant_id));
     if (!variant) {
       throw Object.assign(
         new Error(`Biến thể của "${ci.name}" không còn tồn tại. Vui lòng cập nhật giỏ hàng.`),
         { status: 400 }
       );
     }
-    const product = await Product.findById(ci.product_id).lean();
+    const product = productMap.get(String(ci.product_id));
     if (!product) {
       throw Object.assign(
         new Error(`Sản phẩm "${ci.name}" không còn tồn tại.`),
@@ -155,18 +227,13 @@ async function resolveItems(userId, { selected_item_ids, buy_now_items }) {
       );
     }
 
-    // Build variant label from attributes map
-    const attrs = variant.variant_attributes instanceof Map
-      ? Object.fromEntries(variant.variant_attributes)
-      : (variant.variant_attributes || {});
-
     result.push({
       product_id: product._id,
       variant_id: variant._id,
-      shop_id: product.shop_id || null,
+      shop_id: product.shop_id || variant.shop_id || null,
       name: product.name,
       image_url: variant.images?.[0] || product.images?.[0] || ci.image || "",
-      variant_attributes: attrs,
+      variant_attributes: readVariantAttrs(variant),
       sku: variant.sku || null,
       compare_at_price: variant.compare_at_price || null,
       qty: ci.qty,
@@ -308,6 +375,9 @@ exports.preview = async ({
 
   // Group items by shop + calculate per-shop totals including credits
   const shopGroups = [];
+  if (items.some((item) => !item.shop_id)) {
+    throw Object.assign(new Error("Một số sản phẩm chưa gắn shop hợp lệ."), { status: 400 });
+  }
   const grouped = groupItemsByShop(items);
   let totalCreditsDiscount = 0;
 
@@ -363,7 +433,7 @@ exports.preview = async ({
 // confirm — Creates ONE ORDER PER SHOP
 // Returns array of created orders (multi-vendor split)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.confirm = async ({
+async function confirmCore({
   userId,
   address_id,
   note,
@@ -373,7 +443,7 @@ exports.confirm = async ({
   selected_item_ids,
   buy_now_items,
   payment_method,
-}) => {
+}, session = null) {
   if (!userId) throw Object.assign(new Error("Unauthorized"), { status: 401 });
   if (!address_id) throw Object.assign(new Error("Thiếu địa chỉ nhận hàng"), { status: 400 });
 
@@ -420,6 +490,9 @@ exports.confirm = async ({
   const shipping_fee = Math.max(0, shipping_fee_raw - shippingDiscount);
 
   // ── Split items by shop ───────────────────────────────────────────────────
+  if (items.some((item) => !item.shop_id)) {
+    throw Object.assign(new Error("Một số sản phẩm chưa gắn shop hợp lệ."), { status: 400 });
+  }
   const grouped = groupItemsByShop(items);
   const createdOrders = [];
 
@@ -442,7 +515,7 @@ exports.confirm = async ({
 
     const orderCode = `ORD${new Date().toISOString().slice(2, 10).replace(/-/g, "")}-${uuidv4().slice(0, 6).toUpperCase()}`;
 
-    const order = await Order.create({
+    const [order] = await Order.create([{
       order_code: orderCode,
       user_id: userId,
       shop_id: shopId !== "unknown" ? shopId : null,
@@ -460,7 +533,12 @@ exports.confirm = async ({
       payment_status: "pending",
       note,
       status: method === "COD" ? "order_created" : "payment_pending",
-    });
+    }], { session });
+
+    // Deduct stock immediately for COD (no payment confirmation step)
+    if (method === "COD") {
+      await deductStock(order, session);
+    }
 
     // Deduct credits from ShopCredit balance
     if (shopCreditsUsed > 0) {
@@ -477,7 +555,8 @@ exports.confirm = async ({
               order_id: order._id,
             },
           },
-        }
+        },
+        { session }
       );
     }
 
@@ -491,21 +570,11 @@ exports.confirm = async ({
   }
 
   // ── Increment flash sale quantity_sold counters ───────────────────────────
-  if (flashMap && flashMap.size > 0) {
-    for (const item of items) {
-      const fi = flashMap.get(String(item.variant_id));
-      if (fi) {
-        FlashSale.updateOne(
-          { _id: fi.flashsale_id, "products.variant_id": String(item.variant_id) },
-          { $inc: { "products.$.quantity_sold": item.qty } }
-        ).catch((e) => console.error("[flashsale_qty_sold]", e.message));
-      }
-    }
-  }
+  await incrementFlashSaleSold(items, flashMap, session);
 
   // ── Increment voucher usage counters + audit ─────────────────────────────
   if (voucher) {
-    Voucher.updateOne({ _id: voucher._id }, { $inc: { used_count: 1 } }).catch(() => { });
+    Voucher.updateOne({ _id: voucher._id }, { $inc: { used_count: 1 } }, { session }).catch(() => { });
     audit.log({
       actorId: String(userId),
       action: "VOUCHER_APPLIED",
@@ -521,7 +590,7 @@ exports.confirm = async ({
     });
   }
   if (shipVoucher) {
-    Voucher.updateOne({ _id: shipVoucher._id }, { $inc: { used_count: 1 } }).catch(() => { });
+    Voucher.updateOne({ _id: shipVoucher._id }, { $inc: { used_count: 1 } }, { session }).catch(() => { });
     audit.log({
       actorId: String(userId),
       action: "VOUCHER_APPLIED",
@@ -543,7 +612,7 @@ exports.confirm = async ({
       const cart = await Cart.findOne({ user_id: userId });
       if (cart) {
         cart.items = cart.items.filter((i) => !cartItemIds.includes(i._id));
-        await cart.save();
+        await cart.save({ session });
       }
     } catch (err) {
       console.error("CART_CLEAR_ERROR:", err.message);
@@ -563,4 +632,21 @@ exports.confirm = async ({
     orders: createdOrders,
     pay_url: null,
   };
+}
+
+exports.confirm = async (payload) => {
+  if (process.env.MONGO_TRANSACTIONS !== "true") {
+    return confirmCore(payload);
+  }
+
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await confirmCore(payload, session);
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
 };

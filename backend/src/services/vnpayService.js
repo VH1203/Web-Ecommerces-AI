@@ -1,26 +1,33 @@
-// services/vnpayService.js
+﻿// services/vnpayService.js
 //
 // VNPAY Sandbox payment integration (API v2.1.0).
+// Uses manual HMAC-SHA512 hash (raw decoded values) to match VNPay's verification.
+// IPN response constants imported from `vnpay` library for convenience.
 //
 // Two-callback architecture:
 //
-//   IPN  (vnp_IpnUrl)    — VNPAY server → our server, server-to-server.
+//   IPN  (vnp_IpnUrl)    â€” VNPAY server â†’ our server, server-to-server.
 //                           PRIMARY source of truth for order settlement.
 //                           Must respond with JSON { RspCode, Message }.
 //                           VNPAY retries until it receives RspCode "00" or "02".
 //
-//   Return URL           — VNPAY redirects user's browser → our server → FE.
+//   Return URL           â€” VNPAY redirects user's browser â†’ our server â†’ FE.
 //                           SECONDARY / fallback: also settles if IPN hasn't arrived yet.
-//                           settleVNPayOrder() is idempotent — safe to call from both.
-//
-// Security:
-//   - All params sorted alphabetically before HMAC-SHA512 hashing.
-//   - Hash secret stored only in backend env — never sent to client.
-//   - Both IPN and Return URL re-verify the secure hash before any DB write.
-//   - Double-settlement guard: settleVNPayOrder() is a no-op if already paid.
+//                           settleVNPayOrder() is idempotent â€” safe to call from both.
 
 const crypto   = require("crypto");
 const { v4: uuidv4 } = require("uuid");
+const {
+  IpnSuccess,
+  IpnFailChecksum,
+  IpnInvalidAmount,
+  IpnOrderNotFound,
+  InpOrderAlreadyConfirmed,
+  IpnUnknownError,
+  getDateInGMT7,
+  dateFormat,
+} = require("vnpay");
+
 const vnpayCfg    = require("../config/vnpay");
 const notif       = require("./dbNotificationService");
 const Order       = require("../models/Order");
@@ -28,26 +35,27 @@ const Payment     = require("../models/Payment");
 const Wallet      = require("../models/Wallet");
 const Transaction = require("../models/Transaction");
 const AuditLog    = require("../models/AuditLog");
+const inventory   = require("./inventoryService");
+const finance     = require("./financeLedgerService");
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Normalize library IPN constant { RspCode, Message } to { rspCode, message }
+ * so the existing controller interface remains unchanged.
+ */
+function ipnResponse({ RspCode, Message }, extras = {}) {
+  return { rspCode: RspCode, message: Message, ...extras };
+}
 
 /**
  * Format a JS Date to VNPAY's required YYYYMMDDHHmmss in UTC+7 (Vietnam).
+ * Uses library's getDateInGMT7 + dateFormat for correct timezone handling.
  */
 function formatVNDate(date = new Date()) {
-  const offsetMs = 7 * 60 * 60 * 1000;
-  const vnDate   = new Date(date.getTime() + date.getTimezoneOffset() * 60000 + offsetMs);
-  const pad = (n) => String(n).padStart(2, "0");
-  return (
-    vnDate.getFullYear() +
-    pad(vnDate.getMonth() + 1) +
-    pad(vnDate.getDate()) +
-    pad(vnDate.getHours()) +
-    pad(vnDate.getMinutes()) +
-    pad(vnDate.getSeconds())
-  );
+  return dateFormat(getDateInGMT7(date));
 }
 
 /**
@@ -60,11 +68,8 @@ function sortObject(obj) {
 }
 
 /**
- * Compute HMAC-SHA512 from sorted params.
- *
- * ⚠  Input to HMAC is the RAW (non-URL-encoded) query string.
- *    e.g. "vnp_Amount=100000&vnp_Command=pay&..."
- *    This matches how VNPAY's server computes the hash on their side.
+ * Compute HMAC-SHA512 on raw (non-URL-encoded) sorted query string.
+ * VNPay computes hash on decoded values â€” must match exactly.
  */
 function createSecureHash(params, secret) {
   const signData = Object.keys(sortObject(params))
@@ -78,9 +83,7 @@ function createSecureHash(params, secret) {
 
 /**
  * Extract and verify vnp_SecureHash from a query-param object.
- * Shared by IPN and Return URL handlers.
- *
- * Returns { isValid, params (hash fields stripped), receivedHash }
+ * Returns { isValid, params (hash fields stripped) }
  */
 function extractAndVerifyHash(rawQuery) {
   const params       = { ...rawQuery };
@@ -89,26 +92,23 @@ function extractAndVerifyHash(rawQuery) {
   delete params["vnp_SecureHashType"];
 
   if (!receivedHash) {
-    return { isValid: false, params, receivedHash: "" };
+    return { isValid: false, params };
   }
 
   const computedHash = createSecureHash(params, vnpayCfg.hashSecret);
   const isValid      = computedHash === receivedHash;
 
   if (!isValid) {
-    console.warn(
-      `[VNPAY] Hash mismatch | expected: ${computedHash} | received: ${receivedHash}`
-    );
+    console.warn(`[VNPAY] Hash mismatch | expected: ${computedHash.slice(0,20)}... | received: ${receivedHash.slice(0,20)}...`);
   }
-  return { isValid, params, receivedHash };
+  return { isValid, params };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // createVNPayUrl
 // Builds a VNPAY payment URL for a pending order.
-// Registers both vnp_IpnUrl and vnp_ReturnUrl.
 // Returns: { payUrl, txnRef }
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function createVNPayUrl(orderId, ipAddr) {
   const order = await Order.findById(orderId).lean();
   if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
@@ -123,6 +123,7 @@ async function createVNPayUrl(orderId, ipAddr) {
   const createDate = formatVNDate();
   const expireDate = formatVNDate(new Date(Date.now() + 15 * 60 * 1000)); // +15 min
 
+  const cleanIp = (ipAddr || "127.0.0.1").replace(/^::ffff:/, "").replace(/^::1$/, "127.0.0.1");
   const isLocalhostIpn = /localhost|127\.0\.0\.1/.test(vnpayCfg.ipnUrl);
 
   const params = {
@@ -132,31 +133,29 @@ async function createVNPayUrl(orderId, ipAddr) {
     vnp_Amount:     String(Math.round(order.total_price) * 100),
     vnp_CurrCode:   "VND",
     vnp_TxnRef:     txnRef,
-    vnp_OrderInfo:  `Thanh toan don hang ${order.order_code}`.replace(/[^\x00-\x7F]/g, ""),
+    vnp_OrderInfo:  `Thanh toan don hang ${order.order_code}`,
     vnp_OrderType:  "other",
     vnp_Locale:     "vn",
     vnp_ReturnUrl:  vnpayCfg.returnUrl,
-    vnp_IpAddr:     (ipAddr || "127.0.0.1").replace(/^::ffff:/, ""),
+    vnp_IpAddr:     cleanIp,
     vnp_CreateDate: createDate,
     vnp_ExpireDate: expireDate,
   };
 
-  // Only include IPN URL if it's publicly reachable (skip localhost in dev)
   if (!isLocalhostIpn) {
     params.vnp_IpnUrl = vnpayCfg.ipnUrl;
   }
 
-  // Hash computed on raw sorted string (before URL-encoding)
+  // Hash on raw sorted string (VNPay standard)
   const secureHash   = createSecureHash(params, vnpayCfg.hashSecret);
   const sortedParams = sortObject(params);
 
-  // Final URL — values URL-encoded individually, hash appended last (not encoded)
+  // URL-encode values for the query string
   const queryStr = Object.keys(sortedParams)
     .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(sortedParams[k])}`)
     .join("&");
   const payUrl = `${vnpayCfg.url}?${queryStr}&vnp_SecureHash=${secureHash}`;
 
-  // Upsert a pending Payment record for this attempt
   await Payment.findOneAndUpdate(
     { order_id: order._id, gateway: "VNPAY" },
     {
@@ -174,78 +173,52 @@ async function createVNPayUrl(orderId, ipAddr) {
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 
-  console.log(`[VNPAY] URL created | order: ${order.order_code} | txnRef: ${txnRef}`);
-  console.log(`[VNPAY] TMN Code: ${vnpayCfg.tmnCode} | Amount: ${params.vnp_Amount} | CreateDate: ${createDate}`);
-  console.log(`[VNPAY] SecureHash: ${secureHash.slice(0, 20)}...`);
-  console.log(`[VNPAY] PayURL: ${payUrl.slice(0, 120)}...`);
+  console.log(`[VNPAY] URL created | order: ${order.order_code} | ip: ${cleanIp} | createDate: ${createDate} | expireDate: ${expireDate}`);
   return { payUrl, txnRef };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // verifyIpn
-// Called by the IPN handler (server-to-server from VNPAY).
-// Verifies hash, checks order amount, returns VNPAY ACK codes.
-//
-// VNPAY ACK codes:
-//   "00" — confirmed (stop retrying)
-//   "02" — order already confirmed (idempotent — stop retrying)
-//   "04" — invalid amount
-//   "97" — invalid signature
-//   "99" — unknown / internal error
-//
 // Returns: { rspCode, message, orderCode, transactionNo, bankCode, isSuccess }
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function verifyIpn(query) {
   const { isValid, params } = extractAndVerifyHash(query);
 
   if (!isValid) {
-    return { rspCode: "97", message: "Invalid signature" };
+    return ipnResponse(IpnFailChecksum);
   }
 
-  const responseCode  = params["vnp_ResponseCode"] || "";
   const orderCode     = params["vnp_TxnRef"]        || "";
   const transactionNo = params["vnp_TransactionNo"]  || "";
-  const bankCode      = params["vnp_BankCode"]       || "";
+  const bankCode      = params["vnp_BankCode"]        || "";
   const vnpAmount     = Number(params["vnp_Amount"])  || 0;
-  const isSuccess     = responseCode === "00";
+  const isSuccess     = params["vnp_ResponseCode"] === "00";
 
-  // Look up order by order_code (txnRef = order_code)
   const order = await Order.findOne({ order_code: orderCode }).lean();
   if (!order) {
     console.warn(`[VNPAY IPN] Order not found: ${orderCode}`);
-    return { rspCode: "01", message: "Order not found" };
+    return ipnResponse(IpnOrderNotFound);
   }
 
-  // Idempotency guard — already processed
   if (order.payment_status === "paid") {
-    console.log(`[VNPAY IPN] Order already confirmed: ${orderCode}`);
-    return { rspCode: "02", message: "Order already confirmed", orderCode, transactionNo, bankCode, isSuccess: true };
+    console.log(`[VNPAY IPN] Already confirmed: ${orderCode}`);
+    return ipnResponse(InpOrderAlreadyConfirmed, { orderCode, transactionNo, bankCode, isSuccess: true });
   }
 
-  // Amount integrity check — prevent partial-payment attacks
   const expectedVnpAmount = Math.round(order.total_price) * 100;
   if (vnpAmount !== expectedVnpAmount) {
-    console.error(
-      `[VNPAY IPN] Amount mismatch | expected: ${expectedVnpAmount} | received: ${vnpAmount} | order: ${orderCode}`
-    );
-    return { rspCode: "04", message: "Invalid amount" };
+    console.error(`[VNPAY IPN] Amount mismatch | expected: ${expectedVnpAmount} | received: ${vnpAmount}`);
+    return ipnResponse(IpnInvalidAmount);
   }
 
-  console.log(
-    `[VNPAY IPN] Verified | order: ${orderCode} | success: ${isSuccess} | ` +
-    `responseCode: ${responseCode} | bank: ${bankCode}`
-  );
-  return { rspCode: "00", message: "Confirm Success", orderCode, transactionNo, bankCode, isSuccess };
+  console.log(`[VNPAY IPN] Verified | order: ${orderCode} | success: ${isSuccess} | bank: ${bankCode}`);
+  return ipnResponse(IpnSuccess, { orderCode, transactionNo, bankCode, isSuccess });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // verifyReturnUrl
-// Called by the Return URL handler (browser redirect from VNPAY).
-// Verifies hash only — does NOT check amounts (browser params are user-visible).
-// Settlement via Return URL is a fallback; IPN is the primary source.
-//
 // Returns: { isValid, isSuccess, orderCode, transactionNo, bankCode, responseCode }
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function verifyReturnUrl(query) {
   const { isValid, params } = extractAndVerifyHash(query);
 
@@ -253,34 +226,29 @@ function verifyReturnUrl(query) {
   const isSuccess     = responseCode === "00";
   const orderCode     = params["vnp_TxnRef"]        || "";
   const transactionNo = params["vnp_TransactionNo"]  || "";
-  const bankCode      = params["vnp_BankCode"]       || "";
+  const bankCode      = params["vnp_BankCode"]        || "";
 
-  console.log(
-    `[VNPAY Return] hash: ${isValid} | success: ${isSuccess} | ` +
-    `orderCode: ${orderCode} | responseCode: ${responseCode}`
-  );
+  console.log(`[VNPAY Return] hash: ${isValid} | success: ${isSuccess} | orderCode: ${orderCode}`);
   return { isValid, isSuccess, orderCode, transactionNo, bankCode, responseCode };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// settleVNPayOrder
-// Marks a verified successful payment as paid and credits the shop wallet.
-// IDEMPOTENT — safe to call from both IPN and Return URL handlers.
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// settleVNPayOrder â€” IDEMPOTENT
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function settleVNPayOrder(orderCode, transactionNo, bankCode) {
   const order = await Order.findOne({ order_code: orderCode });
   if (!order) throw Object.assign(new Error(`Order not found: ${orderCode}`), { status: 404 });
 
-  // Double-settlement guard
   if (order.payment_status === "paid") {
-    console.log(`[VNPAY] Already settled: ${orderCode} — skipping`);
+    console.log(`[VNPAY] Already settled: ${orderCode} â€” skipping`);
     return order;
   }
 
   order.payment_status = "paid";
   order.status         = "processing";
   if (!order.status_history) order.status_history = [];
-  order.status_history.push({ status: "processing", at: new Date(), by: "system", note: `VNPAY payment confirmed — txn: ${transactionNo}` });
+  order.status_history.push({ status: "processing", at: new Date(), by: "system", note: `VNPAY payment confirmed â€” txn: ${transactionNo}` });
+  await inventory.deductOrderStock(order);
   await order.save();
 
   await Payment.findOneAndUpdate(
@@ -297,27 +265,13 @@ async function settleVNPayOrder(orderCode, transactionNo, bankCode) {
     }
   );
 
-  // Credit shop wallet — non-fatal
-  try {
-    const shopWallet = await Wallet.findOne({ user_id: order.shop_id, type: "shop" });
-    if (shopWallet) {
-      shopWallet.balance_available += order.total_price;
-      await shopWallet.save();
-      await Transaction.create({
-        wallet_id:  shopWallet._id,
-        order_id:   order._id,
-        type:       "payment",
-        direction:  "in",
-        amount:     order.total_price,
-        currency:   "VND",
-        status:     "success",
-        note:       `VNPAY — order ${order.order_code}`,
-        meta:       { transactionNo, bankCode },
-      });
-    }
-  } catch (walletErr) {
-    console.error("[VNPAY] WALLET_CREDIT_ERROR:", walletErr.message);
-  }
+  const payment = await Payment.findOne({ order_id: order._id, gateway: "VNPAY" }).lean();
+  await finance.recordPaymentCapture(order, {
+    provider: "vnpay",
+    providerTxnId: transactionNo,
+    paymentId: payment?._id || null,
+    metadata: { bankCode },
+  });
 
   await AuditLog.create({
     action:            "VNPAY_PAYMENT_SUCCESS",
@@ -331,17 +285,12 @@ async function settleVNPayOrder(orderCode, transactionNo, bankCode) {
   return order;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// failVNPayOrder
-// Marks a failed or cancelled payment.
-// IDEMPOTENT — no-op if already in a terminal state.
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// failVNPayOrder â€” IDEMPOTENT
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function failVNPayOrder(orderCode, responseCode) {
   const order = await Order.findOne({ order_code: orderCode });
-  if (!order) {
-    console.warn(`[VNPAY] failVNPayOrder: not found ${orderCode}`);
-    return;
-  }
+  if (!order) { console.warn(`[VNPAY] failVNPayOrder: not found ${orderCode}`); return; }
   if (order.payment_status !== "pending") return;
 
   order.payment_status = "failed";
@@ -363,22 +312,18 @@ async function failVNPayOrder(orderCode, responseCode) {
   console.log(`[VNPAY] Failed: ${orderCode} | responseCode: ${responseCode}`);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // createWalletDepositUrl
-// Builds a VNPAY payment URL for a wallet deposit (txnRef has "DEP" prefix).
-// The return URL points to /api/wallets/deposit/vnpay/return (separate from orders).
-// Returns: { payUrl }
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function createWalletDepositUrl(walletId, txnRef, amount, ipAddr) {
   const createDate = formatVNDate();
   const expireDate = formatVNDate(new Date(Date.now() + 15 * 60 * 1000));
 
-  // Derive deposit return URL from the order return URL by replacing the path segment,
-  // or from a dedicated env var.
   const depReturnUrl =
     process.env.VNPAY_DEPOSIT_RETURN_URL ||
     vnpayCfg.returnUrl.replace("/payment/vnpay/return", "/wallets/deposit/vnpay/return");
 
+  const cleanIp = (ipAddr || "127.0.0.1").replace(/^::ffff:/, "").replace(/^::1$/, "127.0.0.1");
   const isLocalhostIpn = /localhost|127\.0\.0\.1/.test(vnpayCfg.ipnUrl);
 
   const params = {
@@ -392,12 +337,11 @@ async function createWalletDepositUrl(walletId, txnRef, amount, ipAddr) {
     vnp_OrderType:  "other",
     vnp_Locale:     "vn",
     vnp_ReturnUrl:  depReturnUrl,
-    vnp_IpAddr:     (ipAddr || "127.0.0.1").replace(/^::ffff:/, ""),
+    vnp_IpAddr:     cleanIp,
     vnp_CreateDate: createDate,
     vnp_ExpireDate: expireDate,
   };
 
-  // Same IPN URL — we distinguish DEP transactions by txnRef prefix in the handler
   if (!isLocalhostIpn) {
     params.vnp_IpnUrl = vnpayCfg.ipnUrl;
   }
@@ -413,69 +357,52 @@ async function createWalletDepositUrl(walletId, txnRef, amount, ipAddr) {
   return { payUrl };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // verifyDepositIpn
-// Verifies hash and looks up the pending deposit Transaction by meta.vnp_txn_ref.
-// Returns the same RspCode/message shape as verifyIpn.
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function verifyDepositIpn(query) {
   const { isValid, params } = extractAndVerifyHash(query);
 
-  if (!isValid) {
-    return { rspCode: "97", message: "Invalid signature" };
-  }
+  if (!isValid) return ipnResponse(IpnFailChecksum);
 
-  const responseCode  = params["vnp_ResponseCode"] || "";
   const txnRef        = params["vnp_TxnRef"]        || "";
   const transactionNo = params["vnp_TransactionNo"]  || "";
-  const bankCode      = params["vnp_BankCode"]       || "";
+  const bankCode      = params["vnp_BankCode"]        || "";
   const vnpAmount     = Number(params["vnp_Amount"])  || 0;
-  const isSuccess     = responseCode === "00";
+  const isSuccess     = params["vnp_ResponseCode"] === "00";
 
   const txn = await Transaction.findOne({ "meta.vnp_txn_ref": txnRef, type: "deposit" }).lean();
   if (!txn) {
-    console.warn(`[VNPAY DEP IPN] Deposit transaction not found: ${txnRef}`);
-    return { rspCode: "01", message: "Deposit not found" };
+    console.warn(`[VNPAY DEP IPN] Deposit not found: ${txnRef}`);
+    return ipnResponse(IpnOrderNotFound, { message: "Deposit not found" });
   }
 
   if (txn.status === "success") {
-    return { rspCode: "02", message: "Already confirmed", txnRef, transactionNo, bankCode, isSuccess: true };
+    return ipnResponse(InpOrderAlreadyConfirmed, { txnRef, transactionNo, bankCode, isSuccess: true });
   }
 
   const expectedAmount = Math.round(txn.amount) * 100;
   if (vnpAmount !== expectedAmount) {
-    console.error(
-      `[VNPAY DEP IPN] Amount mismatch | expected: ${expectedAmount} | received: ${vnpAmount} | txnRef: ${txnRef}`
-    );
-    return { rspCode: "04", message: "Invalid amount" };
+    console.error(`[VNPAY DEP IPN] Amount mismatch | expected: ${expectedAmount} | received: ${vnpAmount}`);
+    return ipnResponse(IpnInvalidAmount);
   }
 
-  console.log(`[VNPAY DEP IPN] Verified | txnRef: ${txnRef} | success: ${isSuccess} | bank: ${bankCode}`);
-  return { rspCode: "00", message: "Confirm Success", txnRef, transactionNo, bankCode, isSuccess };
+  console.log(`[VNPAY DEP IPN] Verified | txnRef: ${txnRef} | success: ${isSuccess}`);
+  return ipnResponse(IpnSuccess, { txnRef, transactionNo, bankCode, isSuccess });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// settleWalletDeposit
-// Credits user wallet on successful VNPay deposit.
-// IDEMPOTENT — no-op if transaction is already "success".
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// settleWalletDeposit â€” IDEMPOTENT
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function settleWalletDeposit(txnRef, transactionNo, bankCode) {
   const txn = await Transaction.findOne({ "meta.vnp_txn_ref": txnRef, type: "deposit" });
-  if (!txn) {
-    console.warn(`[VNPAY DEP] settleWalletDeposit: not found ${txnRef}`);
-    return null;
-  }
-
-  if (txn.status === "success") {
-    console.log(`[VNPAY DEP] Already settled: ${txnRef} — skipping`);
-    return txn;
-  }
+  if (!txn) { console.warn(`[VNPAY DEP] settleWalletDeposit: not found ${txnRef}`); return null; }
+  if (txn.status === "success") { console.log(`[VNPAY DEP] Already settled: ${txnRef}`); return txn; }
 
   const wallet = await Wallet.findById(txn.wallet_id);
   if (!wallet) throw Object.assign(new Error(`Wallet not found: ${txn.wallet_id}`), { status: 404 });
 
-  wallet.balance_available += txn.amount;
-  await wallet.save();
+  await finance.settleWalletDeposit({ wallet, transaction: txn, providerTxnId: transactionNo, bankCode });
 
   txn.status = "success";
   txn.meta   = { ...txn.meta, transactionNo, bankCode, settled_at: new Date().toISOString() };
@@ -493,18 +420,14 @@ async function settleWalletDeposit(txnRef, transactionNo, bankCode) {
   return txn;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// failWalletDeposit
-// Marks a pending deposit transaction as failed.
-// IDEMPOTENT — no-op if not in "pending" state.
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// failWalletDeposit â€” IDEMPOTENT
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function failWalletDeposit(txnRef, responseCode) {
   const txn = await Transaction.findOne({ "meta.vnp_txn_ref": txnRef, type: "deposit" });
   if (!txn || txn.status !== "pending") return;
-
   txn.status = "failed";
   await txn.save();
-
   console.log(`[VNPAY DEP] Failed: ${txnRef} | responseCode: ${responseCode}`);
 }
 
@@ -514,7 +437,6 @@ module.exports = {
   verifyReturnUrl,
   settleVNPayOrder,
   failVNPayOrder,
-  // Wallet deposit
   createWalletDepositUrl,
   verifyDepositIpn,
   settleWalletDeposit,

@@ -1,8 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import "./index.css";
 import "./i18n"; // must be imported before App so translations are ready
+import { initSentry } from "./config/sentry";
 
 import { HeroUIProvider } from "@heroui/react";
 import { GoogleOAuthProvider } from "@react-oauth/google";
@@ -32,24 +34,38 @@ globalStyle.textContent = `
 `;
 document.head.appendChild(globalStyle);
 
+initSentry();
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60 * 1000,
+      refetchOnWindowFocus: false,
+      retry: 1,
+    },
+  },
+});
+
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <ThemeProvider>
-      <LanguageProvider>
-      <HeroUIProvider>
-        <ToastProvider>
-          <BrowserRouter>
-            <AuthProvider>
-              <CartProvider>
-                <NotificationProvider>
-                  <App />
-                </NotificationProvider>
-              </CartProvider>
-            </AuthProvider>
-          </BrowserRouter>
-        </ToastProvider>
-      </HeroUIProvider>
-      </LanguageProvider>
-    </ThemeProvider>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider>
+        <LanguageProvider>
+          <HeroUIProvider>
+            <ToastProvider>
+              <BrowserRouter>
+                <AuthProvider>
+                  <CartProvider>
+                    <NotificationProvider>
+                      <App />
+                    </NotificationProvider>
+                  </CartProvider>
+                </AuthProvider>
+              </BrowserRouter>
+            </ToastProvider>
+          </HeroUIProvider>
+        </LanguageProvider>
+      </ThemeProvider>
+    </QueryClientProvider>
   </React.StrictMode>
 );

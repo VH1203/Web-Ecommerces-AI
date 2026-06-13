@@ -1,10 +1,3 @@
-/**
- * moderationCron.js
- *
- * Scheduled tasks for the moderation system:
- * 1. Auto-unban: every 5 minutes — unban users whose ban_end has passed
- * 2. Violation detection: every 30 minutes — scan for auto-detectable violations
- */
 
 const User      = require("../models/User");
 const Shop      = require("../models/Shop");
@@ -14,9 +7,6 @@ const detection = require("../services/violationDetectionService");
 let unbanInterval   = null;
 let detectionInterval = null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-unban: runs every 5 minutes
-// ─────────────────────────────────────────────────────────────────────────────
 async function autoUnban() {
   try {
     const now = new Date();

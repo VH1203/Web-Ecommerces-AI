@@ -1,4 +1,4 @@
-const checkoutNodeJssdk = require("@paypal/checkout-server-sdk");
+﻿const checkoutNodeJssdk = require("@paypal/checkout-server-sdk");
 const { client } = require("../config/paypal");
 const { v4: uuidv4 } = require("uuid");
 
@@ -8,8 +8,11 @@ const Refund = require("../models/Refund");
 const Wallet = require("../models/Wallet");
 const Transaction = require("../models/Transaction");
 const AuditLog = require("../models/AuditLog");
+const Shop = require("../models/Shop");
+const inventory = require("./inventoryService");
+const finance = require("./financeLedgerService");
 
-// ── VND → USD conversion (sandbox approximation) ──────────────────────────
+// â”€â”€ VND â†’ USD conversion (sandbox approximation) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Replace VND_TO_USD_RATE with a live rate service in production.
 const VND_TO_USD_RATE = Number(process.env.VND_TO_USD_RATE) || 25000;
 
@@ -18,7 +21,7 @@ function toUSD(vndAmount) {
   return usd.toFixed(2); // PayPal requires string with 2 decimal places
 }
 
-// ── createPayPalOrder ──────────────────────────────────────────────────────
+// â”€â”€ createPayPalOrder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Creates a PayPal order from a pending DB order.
 // Returns: paypalOrderId (string)
 async function createPayPalOrder(orderId) {
@@ -58,7 +61,7 @@ async function createPayPalOrder(orderId) {
   return response.result.id; // PayPal order ID
 }
 
-// ── capturePayPalOrder ─────────────────────────────────────────────────────
+// â”€â”€ capturePayPalOrder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Captures an approved PayPal order and settles the DB order.
 // Returns: { order, payment, captureId }
 async function capturePayPalOrder(paypalOrderId, orderId) {
@@ -126,6 +129,7 @@ async function capturePayPalOrder(paypalOrderId, orderId) {
   // Settle DB order
   order.payment_status = "paid";
   order.status = "confirmed";
+  await inventory.deductOrderStock(order);
   await order.save();
 
   // Create successful payment record
@@ -146,30 +150,12 @@ async function capturePayPalOrder(paypalOrderId, orderId) {
     paid_at: new Date(),
   });
 
-  // Credit shop wallet (non-fatal)
-  try {
-    const shopWallet = await Wallet.findOne({
-      user_id: order.shop_id,
-      type: "shop",
-    });
-    if (shopWallet) {
-      shopWallet.balance_available += order.total_price;
-      await shopWallet.save();
-      await Transaction.create({
-        wallet_id: shopWallet._id,
-        order_id: order._id,
-        type: "payment",
-        direction: "in",
-        amount: order.total_price,
-        currency: "VND",
-        status: "success",
-        note: `PayPal payment — order ${order.order_code}`,
-        meta: { paypalOrderId, captureId },
-      });
-    }
-  } catch (walletErr) {
-    console.error("WALLET_CREDIT_ERROR:", walletErr.message);
-  }
+  await finance.recordPaymentCapture(order, {
+    provider: "paypal",
+    providerTxnId: captureId,
+    paymentId: payment._id,
+    metadata: { paypalOrderId },
+  });
 
   // Audit log
   await AuditLog.create({
@@ -182,7 +168,7 @@ async function capturePayPalOrder(paypalOrderId, orderId) {
   return { order, payment, captureId };
 }
 
-// ── refundPayPal ───────────────────────────────────────────────────────────
+// â”€â”€ refundPayPal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Refunds a captured PayPal payment.
 // Returns: { refund, refundId }
 async function refundPayPal(orderId) {
@@ -253,14 +239,15 @@ async function refundPayPal(orderId) {
     user_id: order.user_id,
     reason: "PayPal refund",
     amount: order.total_price,
-    status: "refunded",
+    status: "completed",
     processed_at: new Date(),
   });
 
   // Deduct shop wallet (non-fatal)
   try {
+    const shop = await Shop.findById(order.shop_id).select("owner_id").lean();
     const shopWallet = await Wallet.findOne({
-      user_id: order.shop_id,
+      user_id: shop?.owner_id || order.shop_id,
       type: "shop",
     });
     if (shopWallet && shopWallet.balance_available >= order.total_price) {
@@ -274,7 +261,7 @@ async function refundPayPal(orderId) {
         amount: order.total_price,
         currency: "VND",
         status: "success",
-        note: `PayPal refund — order ${order.order_code}`,
+        note: `PayPal refund â€” order ${order.order_code}`,
         meta: { refundId },
       });
     }

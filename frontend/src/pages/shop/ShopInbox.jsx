@@ -9,9 +9,9 @@ import {
   Package, ShoppingBag, ExternalLink, ImagePlus, X,
 } from "lucide-react";
 import { formatCurrency } from "../../utils/formatCurrency";
+import { API_ORIGIN } from "../../services/env";
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ||
-  (import.meta.env.VITE_API_URL || "http://localhost:5000").replace("/api", "");
+const SOCKET_URL = API_ORIGIN;
 
 function timeAgo(date) {
   if (!date) return "";

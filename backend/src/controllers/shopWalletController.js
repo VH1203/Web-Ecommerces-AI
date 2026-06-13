@@ -1,6 +1,7 @@
 const Wallet      = require("../models/Wallet");
 const Transaction = require("../models/Transaction");
 const auditLog    = require("../services/auditLogService");
+const finance     = require("../services/financeLedgerService");
 
 // GET /api/shop/wallet
 exports.getWallet = async (req, res, next) => {
@@ -61,6 +62,7 @@ exports.requestWithdraw = async (req, res, next) => {
       meta: { bank_account_id: bank_account_id || null },
     });
 
+    await finance.reserveWithdrawal(wallet, txn);
     wallet.last_transaction_id = txn._id;
     await wallet.save();
 

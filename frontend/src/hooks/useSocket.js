@@ -1,11 +1,11 @@
 import { useEffect, useRef } from "react";
 import { io } from "socket.io-client";
+import { API_ORIGIN } from "../services/env";
 
 export default function useSocket(shopId) {
     const ref = useRef();
     useEffect(() => {
-        const url = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
-        const s = io(`${url}/realtime`, {
+        const s = io(`${API_ORIGIN}/realtime`, {
             withCredentials: true,
             reconnection: true,
             reconnectionAttempts: 10,

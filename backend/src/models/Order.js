@@ -13,7 +13,7 @@ const OrderSchema = new mongoose.Schema(
     _id: { type: String, default: () => `ord-${uuidv4()}` },
     order_code: { type: String, required: true, unique: true },
     user_id: { type: String, ref: "User", required: true },
-    shop_id: { type: String, ref: "User", required: true },
+    shop_id: { type: String, ref: "Shop", required: true },
 
     items: [OrderItemSchema],
 
@@ -31,6 +31,12 @@ const OrderSchema = new mongoose.Schema(
       enum: ["pending", "paid", "failed", "refunded"],
       default: "pending",
     },
+    financial_status: {
+      type: String,
+      enum: ["unpaid", "captured", "escrowed", "settled", "partially_refunded", "refunded"],
+      default: "unpaid",
+    },
+    settled_at: { type: Date, default: null },
 
     shipping_provider: { type: String, enum: ["GHN", "GHTK", "NONE"], default: "NONE" },
     shipping_fee: { type: Number, default: 0 },
